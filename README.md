@@ -3,7 +3,7 @@
 [![COOLAPK](https://img.shields.io/badge/%E7%AD%B1%E7%AC%99%E5%A2%A8%E9%9C%B2-%E7%AD%B1%E7%AC%99%E5%A2%A8%E9%9C%B2?style=flat&logo=android&logoColor=FF4500&label=%E9%85%B7%E5%AE%89&color=FF4500
 )](http://www.coolapk.com/u/20080253)
 [![STAR](https://img.shields.io/github/stars/2992253553/Github-Fork-Tool?style=flat&logo=github)](https://github.com/2992253553/Github-Fork-Tool/stargazers)
-![Version](https://img.shields.io/badge/Version-2.0.0-brightgreen.svg)
+![Version](https://img.shields.io/badge/Version-2.1.0-brightgreen.svg)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android-blue.svg)
 ![Shell](https://img.shields.io/badge/Shell-Bash-yellow.svg)
 
@@ -138,6 +138,15 @@ chmod +x github_fork_sync.sh
 
 # 清理配置和缓存
 ./github_fork_sync.sh --clean
+
+# 刷新已经缓存的仓库列表
+./github_fork_sync.sh --refresh
+
+# 指定要同步的仓库及分支（跳过交互）
+./github_fork_sync.sh --repo owner/repo [--branch develop]
+
+# 通过命令行直接提供Token（谨慎使用）
+./github_fork_sync.sh --token <your_token_here>
 ```
 
 Android (Termux) 专用教程

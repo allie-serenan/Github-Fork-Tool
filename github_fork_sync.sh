@@ -20,6 +20,16 @@ CONFIG_FILE="$CONFIG_DIR/config"
 TOKEN_FILE="$CONFIG_DIR/token"
 REPO_CACHE_FILE="$CONFIG_DIR/repos_cache"
 
+# 命令行选项变量
+CLI_REPO=""
+CLI_BRANCH=""
+REFRESH_CACHE=false
+TOKEN_FROM_ARG=""
+
+# 如果用户在环境中导出了 GITHUB_TOKEN，保存一份原始值以便后续识别
+ENV_GITHUB_TOKEN="$GITHUB_TOKEN"
+
+
 # 日志函数
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -477,7 +487,18 @@ create_config_dir() {
 
 # GitHub认证
 github_auth() {
-    if [ -f "$TOKEN_FILE" ]; then
+    # 优先使用命令行参数提供的token
+    if [ -n "$TOKEN_FROM_ARG" ]; then
+        GITHUB_TOKEN="$TOKEN_FROM_ARG"
+        log_info "使用命令行提供的GitHub Token"
+    elif [ -n "$ENV_GITHUB_TOKEN" ]; then
+        # 环境变量中存在 token
+        GITHUB_TOKEN="$ENV_GITHUB_TOKEN"
+        log_info "使用环境变量 GITHUB_TOKEN"
+    fi
+
+    # 如果没有从环境或参数得到 token，则尝试从保存的文件加载
+    if [ -z "$GITHUB_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
         GITHUB_TOKEN=$(cat "$TOKEN_FILE")
         if validate_token; then
             log_success "使用已保存的GitHub Token"
@@ -485,36 +506,47 @@ github_auth() {
         else
             log_warning "保存的Token已失效，需要重新认证"
             rm -f "$TOKEN_FILE"
+            GITHUB_TOKEN=""
         fi
     fi
 
-    log_info "GitHub认证"
-    echo "请按照以下步骤获取GitHub Personal Access Token:"
-    echo "1. 访问 https://github.com/settings/tokens"
-    echo "2. 点击 'Generate new token'"
-    echo "3. 选择 'Generate new token (classic)'"
-    echo "4. 设置备注 (如: Fork Sync Tool)"
-    echo "5. 勾选以下权限:"
-    echo "   - repo (全部)"
-    echo "   - read:org"
-    echo "   - read:user"
-    echo "6. 点击 'Generate token'"
-    echo ""
-    
-    read -p "请输入您的GitHub Personal Access Token: " GITHUB_TOKEN
-    
+    # 仍然没有token时，提示用户输入
     if [ -z "$GITHUB_TOKEN" ]; then
-        log_error "Token不能为空"
-        exit 1
-    fi
-    
-    if validate_token; then
-        echo "$GITHUB_TOKEN" > "$TOKEN_FILE"
-        chmod 600 "$TOKEN_FILE"
-        log_success "Token验证成功并已保存"
+        log_info "GitHub认证"
+        echo "请按照以下步骤获取GitHub Personal Access Token:"
+        echo "1. 访问 https://github.com/settings/tokens"
+        echo "2. 点击 'Generate new token'"
+        echo "3. 选择 'Generate new token (classic)'"
+        echo "4. 设置备注 (如: Fork Sync Tool)"
+        echo "5. 勾选以下权限:"
+        echo "   - repo (全部)"
+        echo "   - read:org"
+        echo "   - read:user"
+        echo "6. 点击 'Generate token'"
+        echo ""
+
+        read -p "请输入您的GitHub Personal Access Token: " GITHUB_TOKEN
+
+        if [ -z "$GITHUB_TOKEN" ]; then
+            log_error "Token不能为空"
+            exit 1
+        fi
+
+        if validate_token; then
+            echo "$GITHUB_TOKEN" > "$TOKEN_FILE"
+            chmod 600 "$TOKEN_FILE"
+            log_success "Token验证成功并已保存"
+        else
+            log_error "Token验证失败"
+            exit 1
+        fi
     else
-        log_error "Token验证失败"
-        exit 1
+        # 如果token是从环境变量或参数提供，则验证但不保存
+        if ! validate_token; then
+            log_error "提供的Token无效"
+            exit 1
+        fi
+        log_success "Token 验证成功"
     fi
 }
 
@@ -576,6 +608,27 @@ get_forked_repos() {
 
 # 选择仓库
 select_repository() {
+    # 如果命令行指定了仓库则直接使用
+    if [ -n "$CLI_REPO" ]; then
+        log_info "使用命令行指定的仓库: $CLI_REPO"
+        SELECTED_REPO_NAME="$CLI_REPO"
+        # 获取仓库信息以检验存在并拿到 URL
+        local response
+        response=$(github_api "/repos/$CLI_REPO")
+        SELECTED_REPO_URL=$(echo "$response" | jq -r '.html_url')
+        if [ "$SELECTED_REPO_URL" = "null" ] || [ -z "$SELECTED_REPO_URL" ]; then
+            log_error "指定的仓库不存在: $CLI_REPO"
+            exit 1
+        fi
+        log_success "已选择仓库: $SELECTED_REPO_NAME"
+        return
+    fi
+
+    # 如果需要刷新缓存则移除旧文件
+    if [ "$REFRESH_CACHE" = true ]; then
+        rm -f "$REPO_CACHE_FILE"
+    fi
+
     if [ ! -f "$REPO_CACHE_FILE" ]; then
         get_forked_repos
     fi
@@ -673,7 +726,8 @@ check_uncommitted_changes() {
         echo "1) 暂存更改 (推荐)"
         echo "2) 丢弃更改"
         echo "3) 退出脚本"
-        read -p "请输入选择 (1/2/3): " choice
+        echo "4) 暂存更改到 stash 并继续"
+        read -p "请输入选择 (1/2/3/4): " choice
         
         case $choice in
             1)
@@ -688,6 +742,10 @@ check_uncommitted_changes() {
             3)
                 log_info "用户选择退出"
                 exit 0
+                ;;
+            4)
+                git stash push -u -m "自动stash: $(date '+%Y-%m-%d %H:%M:%S')"
+                log_success "已将未提交更改存入 stash"
                 ;;
             *)
                 log_error "无效选择"
@@ -711,36 +769,49 @@ sync_fork() {
     log_info "获取上游仓库更新..."
     git fetch upstream --tags --force
     
-    # 备份当前分支（如果不是main/master）
-    if [ "$CURRENT_BRANCH" != "main" ] && [ "$CURRENT_BRANCH" != "master" ]; then
-        log_info "备份当前分支: $CURRENT_BRANCH"
-        git branch -f "backup-$CURRENT_BRANCH-$(date '+%Y%m%d')" "$CURRENT_BRANCH"
-    fi
-    
-    # 确定主分支名称
-    if git show-ref --verify --quiet refs/heads/main; then
-        MAIN_BRANCH="main"
-    elif git show-ref --verify --quiet refs/heads/master; then
-        MAIN_BRANCH="master"
+    # 备份当前分支（如果不是 main/master 或指定分支）
+    if [ -n "$CLI_BRANCH" ]; then
+        TARGET_BRANCH="$CLI_BRANCH"
+        log_info "目标同步分支由命令行指定: $TARGET_BRANCH"
     else
-        log_error "未找到main或master分支"
-        exit 1
+        TARGET_BRANCH=""
     fi
     
-    log_info "使用主分支: $MAIN_BRANCH"
+    if [ -z "$TARGET_BRANCH" ]; then
+        # 确定主分支名称
+        if git show-ref --verify --quiet refs/heads/main; then
+            TARGET_BRANCH="main"
+        elif git show-ref --verify --quiet refs/heads/master; then
+            TARGET_BRANCH="master"
+        else
+            log_error "未找到 main 或 master 分支，也未指定 --branch"
+            exit 1
+        fi
+    fi
     
-    # 切换到主分支
-    if [ "$CURRENT_BRANCH" != "$MAIN_BRANCH" ]; then
-        git checkout "$MAIN_BRANCH"
+    log_info "使用主分支: $TARGET_BRANCH"
+    
+    # 备份当前分支，如果需要
+    if [ "$CURRENT_BRANCH" != "$TARGET_BRANCH" ]; then
+        log_info "备份当前分支: $CURRENT_BRANCH"
+        git branch -f "backup-$CURRENT_BRANCH-$(date '+%Y%m%d')" "$CURRENT_BRANCH" || true
+    fi
+    
+    # 切换到目标分支
+    if [ "$CURRENT_BRANCH" != "$TARGET_BRANCH" ]; then
+        git checkout "$TARGET_BRANCH" || git checkout -b "$TARGET_BRANCH" "upstream/$TARGET_BRANCH"
     fi
     
     # 重置到上游状态
     log_info "重置本地分支到上游状态..."
-    git reset --hard "upstream/$MAIN_BRANCH"
+    git reset --hard "upstream/$TARGET_BRANCH"
     
     # 推送到origin
     log_info "推送到复刻仓库..."
-    git push origin "$MAIN_BRANCH" --force
+    git push origin "$TARGET_BRANCH" --force
+    
+    # 保存对外使用的分支变量
+    MAIN_BRANCH="$TARGET_BRANCH"
     
     log_success "同步完成!"
 }
@@ -749,6 +820,7 @@ sync_fork() {
 show_sync_info() {
     log_info "同步统计:"
     echo "------------------------"
+    echo "分支: $MAIN_BRANCH"
     
     # 获取一年前的日期
     local one_year_ago
@@ -786,15 +858,20 @@ show_usage() {
     echo "  $0 [选项]"
     echo ""
     echo "选项:"
-    echo "  -h, --help     显示此帮助信息"
-    echo "  -v, --version  显示版本信息"
-    echo "  --clean        清理缓存和配置"
+    echo "  -h, --help         显示此帮助信息"
+    echo "  -v, --version      显示版本信息"
+    echo "  --clean            清理缓存和配置"
+    echo "  --refresh          刷新仓库列表缓存，从GitHub重新拉取"
+    echo "  --repo <owner/repo>  直接指定要同步的复刻仓库"
+    echo "  --branch <branch>    指定要同步的分支，默认为 main/master"
+    echo "  --token <token>      通过命令行指定GitHub Token (会覆盖环境变量/配置)"
     echo ""
     echo "功能:"
     echo "  1. 自动检测并安装所需依赖"
     echo "  2. GitHub 认证和仓库列表获取"
-    echo "  3. 选择要同步的复刻仓库"
+    echo "  3. 选择要同步的复刻仓库 (可通过 --repo 自动选择)"
     echo "  4. 自动同步上游所有提交记录"
+    echo "  5. 支持将Token通过环境变量或命令行传入"
     echo ""
 }
 
@@ -810,30 +887,51 @@ cleanup_config() {
 
 # 显示版本信息
 show_version() {
-    echo "GitHub Fork Sync Tool v1.1.0"
+    echo "GitHub Fork Sync Tool v2.1.0"
     echo "支持自动依赖安装和完整复刻同步"
     echo "支持的操作系统: macOS, Windows, Linux (多种发行版), FreeBSD, OpenBSD"
 }
 
+
 # 参数解析
 parse_arguments() {
-    case "$1" in
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        -v|--version)
-            show_version
-            exit 0
-            ;;
-        --clean)
-            cleanup_config
-            exit 0
-            ;;
-        *)
-            # 无参数或未知参数，继续执行主程序
-            ;;
-    esac
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            --clean)
+                cleanup_config
+                exit 0
+                ;;
+            --refresh)
+                REFRESH_CACHE=true
+                ;;
+            --repo)
+                shift
+                CLI_REPO="$1"
+                ;;
+            --branch)
+                shift
+                CLI_BRANCH="$1"
+                ;;
+            --token)
+                shift
+                TOKEN_FROM_ARG="$1"
+                ;;
+            *)
+                log_warning "未知参数: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
 }
 
 # 主函数
